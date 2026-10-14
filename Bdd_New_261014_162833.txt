@@ -1,0 +1,24 @@
+import pandas as pd
+
+Trier par FCP et date
+df_vl["Date_VL"] = pd.to_datetime(df_vl["Date_VL"])
+df_vl = df_vl.sort_values(["FCP", "Date_VL"]).copy()
+
+Identifier les changements de VL par FCP
+changement = (
+df_vl.groupby("FCP")["Montant_VL"]
+.transform(lambda s: s.ne(s.shift()))
+)
+
+Créer un identifiant de séquence par FCP
+df_vl["sequence"] = changement.groupby(
+df_vl["FCP"]
+).cumsum()
+
+Compter les jours par séquence de VL identique
+df_vl["nb_jours_vl_inchangee"] = (
+df_vl.groupby(["FCP", "sequence"])["Date_VL"]
+.transform("nunique")
+)
+
+print(df_vl)
