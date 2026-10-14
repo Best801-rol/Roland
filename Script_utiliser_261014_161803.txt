@@ -1,0 +1,109 @@
+import pandas as pd
+
+Colonnes supposées : FCP, Date_VL, Montant_VL
+df_feries contient : Date_ferie
+
+df_vl["Date_VL"] = pd.to_datetime(
+df_vl["Date_VL"], errors="coerce"
+).dt.normalize()
+
+df_vl["Montant_VL"] = pd.to_numeric(
+df_vl["Montant_VL"], errors="coerce"
+)
+
+df_feries["Date_ferie"] = pd.to_datetime(
+df_feries["Date_ferie"], errors="coerce"
+).dt.normalize()
+
+jours_feries = set(df_feries["Date_ferie"].dropna())
+
+Conserver l'ordre initial pour restituer la base
+df_vl["_ordre_initial"] = range(len(df_vl))
+
+Trier chronologiquement par FCP
+df_vl = df_vl.sort_values(["FCP", "Date_VL"]).copy()
+
+Identifier les jours ouvrés
+df_vl["_jour_ouvre"] = (
+df_vl["Date_VL"].notna()
+& (df_vl["Date_VL"].dt.weekday < 5)
+& (~df_vl["Date_VL"].isin(jours_feries))
+)
+
+Calcul sur les seules dates ouvrées avec une VL renseignée
+ouvrable = df_vl[
+df_vl["_jour_ouvre"] & df_vl["Montant_VL"].notna()
+].copy()
+
+Calendrier des jours ouvrés de la période
+calendrier = pd.DataFrame({
+"Date_VL": pd.date_range(
+ouvrable["Date_VL"].min(),
+ouvrable["Date_VL"].max(),
+freq="D"
+)
+})
+
+calendrier = calendrier[
+(calendrier["Date_VL"].dt.weekday < 5)
+& (~calendrier["Date_VL"].isin(jours_feries))
+].copy()
+
+Rang de chaque jour ouvré
+calendrier["rang_ouvre"] = range(len(calendrier))
+
+ouvrable = ouvrable.merge(
+calendrier,
+on="Date_VL",
+how="left"
+)
+
+Une nouvelle séquence commence si :
+- le FCP change ;
+- la VL change ;
+- un jour ouvré attendu manque entre deux dates observées.
+groupe = ouvrable.groupby("FCP", sort=False)
+
+ouvrable["_vl_precedente"] = groupe["Montant_VL"].shift()
+ouvrable["_rang_precedent"] = groupe["rang_ouvre"].shift()
+
+nouvelle_sequence = (
+ouvrable["_vl_precedente"].isna()
+| ouvrable["Montant_VL"].ne(ouvrable["_vl_precedente"])
+| ouvrable["rang_ouvre"].ne(
+ouvrable["_rang_precedent"] + 1
+)
+)
+
+ouvrable["_sequence"] = nouvelle_sequence.groupby(
+ouvrable["FCP"], sort=False
+).cumsum()
+
+Nombre de jours ouvrés dans chaque séquence stable
+ouvrable["nb_jours_vl_inchangee"] = (
+ouvrable.groupby(["FCP", "_sequence"])["Date_VL"]
+.transform("nunique")
+)
+
+Rattacher le résultat à la base initiale
+df_vl = df_vl.merge(
+ouvrable[[
+"_ordre_initial", "nb_jours_vl_inchangee"
+ ]],
+on="_ordre_initial",
+how="left",
+validate="one_to_one"
+)
+
+Restaurer l'ordre et nettoyer
+df_vl = (
+df_vl.sort_values("_ordre_initial")
+.drop(columns=[
+"_ordre_initial", "_jour_ouvre"
+ ])
+.reset_index(drop=True)
+)
+
+df_vl["nb_jours_vl_inchangee"] = (
+df_vl["nb_jours_vl_inchangee"].fillna(0).astype(int)
+)
