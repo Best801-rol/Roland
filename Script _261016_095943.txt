@@ -1,0 +1,35 @@
+import pandas as pd
+
+Trier les données par FCP et date
+df = df.sort_values(["FCP", "Date"]).copy()
+
+Identifier les opérations de souscription et de rachat
+operation = (
+df["typeoperation"]
+.astype("string")
+.str.strip()
+.str.lower()
+.isin(["souscription", "rachat"])
+)
+
+Comparer la VL actuelle à celle de la ligne précédente
+vl_precedente = df.groupby("FCP")["VL"].shift(1)
+
+Vérifier l'absence d'opération à la date précédente
+operation_precedente = (
+operation.groupby(df["FCP"]).shift(1)
+)
+
+Détecter les cas suspects
+condition = (
+df["VL"].ne(vl_precedente)
+& df["VL"].notna()
+& vl_precedente.notna()
+& ~operation
+& ~operation_precedente.fillna(True)
+)
+
+Extraire les lignes concernées
+anomalies = df.loc[condition].copy()
+
+print(anomalies)
