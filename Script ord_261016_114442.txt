@@ -1,0 +1,28 @@
+import pandas as pd
+
+Dates déjà ordonnées : on conserve cet ordre
+dates_vl = pd.to_datetime(df['Date_actuel'])
+dates_op = pd.to_datetime(Operation['Date_operation'])
+
+VL précédente du même fonds, sans créer de colonne dans df
+vl_precedente = df.groupby('FCP')['VL'].shift(1)
+
+Date précédente, calculée temporairement, sans créer de colonne
+date_precedente = df.groupby('FCP')['Date_actuel'].shift(1)
+
+Absence d'opérations à la date précédente et à la date actuelle
+sans_operation_precedente = ~pd.to_datetime(date_precedente).isin(dates_op)
+sans_operation_actuelle = ~dates_vl.isin(dates_op)
+
+VL différente de celle de la date précédente
+vl_a_varie = df['VL'].ne(vl_precedente)
+
+Résultat : uniquement les lignes suspectes
+df_suspect = df[
+sans_operation_precedente
+& sans_operation_actuelle
+& vl_a_varie
+& vl_precedente.notna()
+].copy()
+
+print(df_suspect)
