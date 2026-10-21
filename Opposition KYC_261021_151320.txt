@@ -1,0 +1,62 @@
+import pandas as pd
+
+1. Conversion des dates
+posted_transactions["date_operation"] = pd.to_datetime(
+posted_transactions["date_operation"],
+errors="coerce"
+)
+
+oppositions["DOU_S"] = pd.to_datetime(
+oppositions["DOU_S"],
+errors="coerce",
+dayfirst=True
+)
+
+2. Garder uniquement les oppositions KYC
+kyc = oppositions[
+oppositions["OPP_S"].astype(str).str.contains(
+"KYC", case=False, na=False
+)
+].copy()
+
+3. Séparer les validations et les levées
+validations = kyc[kyc["ETA_S"] == "V"].copy()
+levees = kyc[kyc["ETA_S"] == "L"].copy()
+
+4. Rechercher les transactions réalisées pendant une opposition active
+resultats = []
+
+for _, transaction in posted_transactions.iterrows():
+
+compte = transaction["NCP_S"]
+date_operation = transaction["date_operation"]
+
+# Validations KYC antérieures ou égales à la transaction
+v = validations[
+(validations["NCP_S"] == compte) &
+(validations["DOU_S"] <= date_operation)
+]
+
+for _, opposition in v.iterrows():
+
+# Levée postérieure à la validation et antérieure
+# ou égale à la date de transaction
+l = levees[
+(levees["NCP_S"] == compte) &
+(levees["OPP_S"] == opposition["OPP_S"]) &
+(levees["DOU_S"] > opposition["DOU_S"]) &
+(levees["DOU_S"] <= date_operation)
+]
+
+# Si aucune levée n'existe avant la transaction,
+# l'opposition était encore active
+if l.empty:
+resultats.append(transaction)
+
+5. Résultat final
+transactions_sous_opposition = pd.DataFrame(resultats)
+
+print("Nombre de transactions suspectes :",
+len(transactions_sous_opposition))
+
+display(transactions_sous_opposition)
