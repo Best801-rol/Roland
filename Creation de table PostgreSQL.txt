@@ -1,0 +1,93 @@
+### Creation des différentes  tables Postregrsl 
+### Charger les données dans les différentes tables  raw , stagging , core , mart 
+### Effextuess les traitements 
+
+CREATE SCHEMA IF NOT EXISTS core;
+CREATE SCHEMA IF NOT EXISTS reporting;
+
+CREATE TABLE core.clients (
+client_id TEXT PRIMARY KEY,
+nom TEXT,
+ville TEXT
+);
+
+CREATE TABLE core.contrats (
+contrat_id TEXT PRIMARY KEY,
+client_id TEXT NOT NULL REFERENCES core.clients(client_id),
+date_contrat DATE,
+montant_total NUMERIC(14, 2) NOT NULL,
+statut TEXT NOT NULL
+);
+
+CREATE TABLE core.echeances (
+paiement_id TEXT PRIMARY KEY,
+contrat_id TEXT NOT NULL REFERENCES core.contrats(contrat_id),
+date_echeance DATE NOT NULL,
+montant_du NUMERIC(14, 2) NOT NULL,
+montant_paye NUMERIC(14, 2) NOT NULL DEFAULT 0
+);
+
+### Creation des tables Raw et utiliser l'outil graphique pour Chargement dans les tables  
+
+CREATE TABLE IF NOT EXISTS raw.clients (
+client_id TEXT,
+nom TEXT,
+ville TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raw.contrats (
+contrat_id TEXT,
+client_id TEXT,
+date_contrat TEXT,
+montant_total TEXT,
+statut TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raw.paiements (
+paiement_id TEXT,
+contrat_id TEXT,
+date_echeance TEXT,
+montant_du TEXT,
+montant_paye TEXT
+);
+
+Nettoyer les données dans STAGING
+A. Créer les tables STAGING
+
+CREATE TABLE IF NOT EXISTS staging.clients (
+client_id TEXT,
+nom TEXT,
+ville TEXT
+);
+
+CREATE TABLE IF NOT EXISTS staging.contrats (
+contrat_id TEXT,
+client_id TEXT,
+date_contrat DATE,
+montant_total NUMERIC(14,2),
+statut TEXT
+);
+
+CREATE TABLE IF NOT EXISTS staging.paiements (
+paiement_id TEXT,
+contrat_id TEXT,
+date_echeance DATE,
+montant_du NUMERIC(14,2),
+montant_paye NUMERIC(14,2)
+);
+
+Nettoyer les clients
+
+INSERT INTO staging.clients (client_id, nom, ville)
+SELECT DISTINCT
+NULLIF(TRIM(client_id), ''),
+NULLIF(TRIM(nom), ''),
+NULLIF(INITCAP(TRIM(ville)), '')
+FROM raw.clients
+WHERE NULLIF(TRIM(client_id), '') IS NOT NULL;
+
+Cette requête :
+Supprime les espaces inutiles.
+Remplace les chaînes vides par NULL.
+Harmonise la casse des villes et supprime les doublons strictement identiques.
+Écarte les lignes sans identifiant client.
