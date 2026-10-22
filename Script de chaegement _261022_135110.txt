@@ -1,0 +1,42 @@
+import pandas as pd
+from sqlalchemy import create_engine
+import os
+from pathlib import Path
+
+def charger_les_5_fichiers(source_dir: Path):
+# 1. Récupérer l'URL de la base de données depuis les variables d'environnement
+db_url = os.getenv("DATABASE_URL")
+if not db_url:
+raise ValueError("La variable DATABASE_URL n'est pas définie.")
+
+# 2. Créer le moteur de connexion
+# Note: On utilise 'postgresql://' pour Pandas/SQLAlchemy
+engine = create_engine(db_url)
+
+# 3. La liste de vos 5 fichiers (déjà dans votre code ligne 33)
+FILES = ["subsidiaries", "customers", "contracts", "payments", "installations"]
+
+# 4. Boucler sur chaque fichier
+for nom_fichier in FILES:
+# Construire le chemin complet (ex: data/run1/customers.csv)
+chemin_fichier = source_dir / f"{nom_fichier}.csv"
+
+print(f"⏳ Chargement de {nom_fichier}.csv...")
+
+if not chemin_fichier.exists():
+print(f"❌ Fichier introuvable : {chemin_fichier}. Ignoré.")
+continue
+
+try:
+# Lire le fichier CSV avec Pandas
+df = pd.read_csv(chemin_fichier)
+
+# Insérer les données dans PostgreSQL
+# 'if_exists="append"' ajoute les données à la table existante.
+# 'index=False' évite de créer une colonne inutile pour l'index.
+df.to_sql(nom_fichier, engine, if_exists="append", index=False)
+
+print(f"✅ {len(df)} lignes insérées dans la table '{nom_fichier}'.")
+
+except Exception as e:
+print(f"❌ Erreur lors du chargement de {nom_fichier} : {e}")
