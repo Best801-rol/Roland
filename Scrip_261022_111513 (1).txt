@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS payments (
+transaction_id VARCHAR(50) PRIMARY KEY,
+contract_id VARCHAR(50),
+payment_date DATETIME,
+amount DECIMAL(10, 2),
+channel VARCHAR(50),
+transaction_status VARCHAR(50)
+);
+
+CREATE TABLE IF NOT EXISTS installations (
+installation_id VARCHAR(50) PRIMARY KEY,
+contract_id VARCHAR(50),
+installation_date DATE,
+region VARCHAR(100),
+installation_status VARCHAR(50)
+);
