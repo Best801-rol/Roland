@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+ETL : chargement des fichiers sources dans PostgreSQL.
+
+Étapes : vérification de structure -> normalisation -> détection d'anomalies
+-> chargement transactionnel idempotent -> traçabilité (etl_runs, data_quality_log).
+
+Usage :
+python etl/run_pipeline.py --input-dir data/run1 --log-dir logs 
+ --dsn "postgresql://user:pwd@localhost:5432/dbname"
+
+Le DSN peut aussi venir de la variable d'environnement DATABASE_URL.
+"""
+import argparse
+import hashlib
+import logging
+import os
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
+
+--------------------------------------------------------------------------
+CONFIGURATION : À ADAPTER aux 5 fichiers et au schéma fournis
+L'ordre compte (les tables parentes d'abord, pour les clés étrangères).
+cols : colonnes attendues (= colonnes de la table cible)
+key : clé métier unique (sert à détecter les doublons + ON CONFLICT)
+dates : colonnes à convertir en date
+amounts : colonnes à convertir en nombre (rejet si négatif)
+upper : colonnes à mettre en majuscules (codes)
+fks : {colonne: (table_parente, colonne_parente)}
+Chaque table cible doit avoir : source_file, source_row, run_id
+--------------------------------------------------------------------------
+SOURCES = {
+"filiales.csv": dict(
+table="filiale", key=["code"], cols=["code", "nom"],
+dates=[], amounts=[], upper=["code"], fks={},
+),
+"clients.csv": dict(
+table="client", key=["client_id"], cols=["client_id", "nom", "filiale"],
+dates=[], amounts=[], upper=["filiale"],
+fks={"filiale": ("filiale", "code")},
+),
+"contrats.csv": dict(
+table="contrat", key=["contrat_id"],
+cols=["contrat_id", "client_id", "filiale", "date_signature", "montant"],
+dates=["date_signature"], amounts=["montant"], upper=["filiale"],
+fks={"filiale": ("filiale", "code"), "client_id": ("client", "client_id")},
+),
+"encaissements.csv": dict(
+table="encaissement", key=["encaissement_id"],
+cols=["encaissement_id", "contrat_id", "date_encaissement", "montant"],
+dates=["date_encaissement"], amounts=["montant"], upper=[],
+fks={"contrat_id": ("contrat", "contrat_id")},
+),
+"installations.csv": dict(
+table="installation", key=["installation_id"],
+cols=["installation_id", "contrat_id", "date_installation"],
+dates=["date_installation"], amounts=[], upper=[],
+fks={"contrat_id": ("contrat", "contrat_id")},
+),
+}
+
+DDL_LOGS = """
+CREATE TABLE IF NOT EXISTS etl_runs (
+run_id TEXT PRIMARY KEY,
+started_at TIMESTAMP NOT NULL,
+ended_at TIMESTAMP,
+status TEXT NOT NULL, -- RUNNING / SUCCESS / FAILED / SKIPPED
+files_hash TEXT,
+rows_read INTEGER DEFAULT 0,
+rows_rejected INTEGER DEFAULT 0,
+rows_loaded INTEGER DEFAULT 0,
+error TEXT
+);
+CREATE TABLE IF NOT EXISTS data_quality_log (
+id SERIAL PRIMARY KEY,
+run_id TEXT NOT NULL,
+source_file TEXT NOT NULL,
+source_row INTEGER,
+rule TEXT NOT NULL,
+value TEXT,
+created_at TIMESTAMP DEFAULT now()
+);
+"""
+
+log = logging.getLogger("etl")
+
+class FatalError(Exception):
+"""Erreur bloquante : le run est annulé (rollback)."""
+
+--------------------------------------------------------------------------
+Lecture, structure, normalisation
+--------------------------------------------------------------------------
+def read_file(path: Path) -> pd.DataFrame:
+if not path.exists():
+raise FatalError(f"Fichier manquant : {path.name}")
+if path.suffix.lower() in (".xlsx", ".xls"):
+df = pd.read_excel(path, dtype=str)
+else:
+df = pd.read_csv(path, dtype=str, sep=None, engine="python",
+encoding="utf-8-sig")
+df.columns = [c.strip().lower() for c in df.columns]
+return df
+
+def check_structure(df: pd.DataFrame, spec: dict, name: str) -> None:
+missing = [c for c in spec["cols"] if c not in df.columns]
+if missing:
+raise FatalError(f"{name} : colonnes manquantes {missing}")
+
+def normalize(df: pd.DataFrame, spec: dict, name: str, anomalies: list):
+"""Nettoie, convertit les types et renvoie (df_valide, nb_rejets)."""
+df = df[spec["cols"]].copy()
+df["source_row"] = df.index + 2 # +2 : ligne d'en-tête + base 1
+df["source_file"] = name
+
+for c in spec["cols"]:
+df[c] = df[c].astype("string").str.strip().replace("", pd.NA)
+for c in spec["upper"]:
+df[c] = df[c].str.upper()
+
+bad = pd.Series(False, index=df.index)
+
+def reject(mask, rule, col):
+nonlocal bad
+for idx in df.index[mask & ~bad]:
+anomalies.append((name, int(df.at[idx, "source_row"]), rule,
+None if pd.isna(df.at[idx, col]) else str(df.at[idx, col])))
+bad |= mask
+
+# Clé manquante
+for k in spec["key"]:
+reject(df[k].isna(), f"cle_manquante:{k}", k)
+
+# Dates invalides
+for c in spec["dates"]:
+raw = df[c]
+parsed = pd.to_datetime(raw, errors="coerce", dayfirst=True)
+reject(raw.notna() & parsed.isna(), f"date_invalide:{c}", c)
+reject(raw.isna(), f"date_manquante:{c}", c)
+df[c] = parsed.dt.date
+
+# Montants invalides ou négatifs
+for c in spec["amounts"]:
+raw = df[c].str.replace(r"\s", "", regex=True).str.replace(",", ".", regex=False)
+num = pd.to_numeric(raw, errors="coerce")
+reject(df[c].notna() & num.isna(), f"montant_invalide:{c}", c)
+reject(df[c].isna(), f"montant_manquant:{c}", c)
+reject(num < 0, f"montant_negatif:{c}", c)
+df[c] = num
+
+# Doublons sur la clé métier : on conserve la 1re occurrence
+dup = df.duplicated(subset=spec["key"], keep="first") & ~bad
+reject(dup, "doublon_cle", spec["key"][0])
+
+return df[~bad].copy(), int(bad.sum())
+
+--------------------------------------------------------------------------
+Chargement
+--------------------------------------------------------------------------
+def check_foreign_keys(cur, df, spec, name, anomalies):
+"""Rejette les lignes dont la clé étrangère n'existe pas dans la table parente."""
+for col, (ptable, pcol) in spec["fks"].items():
+cur.execute(f"SELECT {pcol} FROM {ptable}")
+known = {str(r[0]) for r in cur.fetchall()}
+mask = ~df[col].astype(str).isin(known)
+for _, row in df[mask].iterrows():
+anomalies.append((name, int(row["source_row"]),
+f"cle_etrangere_inconnue:{col}", str(row[col])))
+df = df[~mask]
+return df
+
+def insert_rows(cur, df, spec, run_id) -> int:
+cols = spec["cols"] + ["source_file", "source_row", "run_id"]
+df = df.assign(run_id=run_id)[cols].astype(object)
+df = df.where(df.notna(), None)
+rows = [tuple(r) for r in df.itertuples(index=False, name=None)]
+if not rows:
+return 0
+sql = (f"INSERT INTO {spec['table']} ({', '.join(cols)}) VALUES %s "
+f"ON CONFLICT ({', '.join(spec['key'])}) DO NOTHING RETURNING 1")
+inserted = execute_values(cur, sql, rows, page_size=1000, fetch=True)
+return len(inserted)
+
+def files_hash(input_dir: Path) -> str:
+h = hashlib.sha256()
+for name in sorted(SOURCES):
+p = input_dir / name
+if p.exists():
+h.update(name.encode())
+h.update(p.read_bytes())
+return h.hexdigest()
+
+--------------------------------------------------------------------------
+Traçabilité
+--------------------------------------------------------------------------
+def save_run(conn, run_id, started, status, fhash, read, rejected, loaded,
+error, anomalies):
+with conn, conn.cursor() as cur:
+cur.execute(
+"""INSERT INTO etl_runs (run_id, started_at, ended_at, status, files_hash,
+rows_read, rows_rejected, rows_loaded, error)
+VALUES (%s,%s,now(),%s,%s,%s,%s,%s,%s)
+ON CONFLICT (run_id) DO UPDATE SET ended_at = now(), status = EXCLUDED.status,
+rows_read = EXCLUDED.rows_read, rows_rejected = EXCLUDED.rows_rejected,
+rows_loaded = EXCLUDED.rows_loaded, error = EXCLUDED.error""",
+(run_id, started, status, fhash, read, rejected, loaded, error),
+)
+if anomalies:
+execute_values(
+cur,
+"INSERT INTO data_quality_log (run_id, source_file, source_row, rule, value) VALUES %s",
+[(run_id, *a) for a in anomalies],
+)
+
+--------------------------------------------------------------------------
+Pipeline
+--------------------------------------------------------------------------
+def run(args) -> int:
+input_dir = Path(args.input_dir)
+run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+started = datetime.now()
+anomalies: list = []
+n_read = n_rejected = n_loaded = 0
+fhash = None
+
+conn = psycopg2.connect(args.dsn)
+try:
+with conn, conn.cursor() as cur:
+cur.execute(DDL_LOGS)
+
+fhash = files_hash(input_dir)
+
+# Idempotence : même contenu déjà chargé -> on ne recharge pas
+if not args.force:
+with conn.cursor() as cur:
+cur.execute("SELECT run_id FROM etl_runs WHERE files_hash=%s AND status='SUCCESS'",
+(fhash,))
+prev = cur.fetchone()
+conn.rollback()
+if prev:
+log.warning("Dossier déjà traité (run %s) : rien à faire.", prev[0])
+save_run(conn, run_id, started, "SKIPPED", None, 0, 0, 0,
+f"Déjà traité par {prev[0]}", [])
+return 0
+
+# Tout le chargement dans UNE transaction : tout ou rien
+with conn:
+with conn.cursor() as cur:
+for name, spec in SOURCES.items():
+df = read_file(input_dir / name)
+check_structure(df, spec, name)
+read = len(df)
+
+clean, rejected = normalize(df, spec, name, anomalies)
+before = len(clean)
+clean = check_foreign_keys(cur, clean, spec, name, anomalies)
+rejected += before - len(clean)
+
+loaded = insert_rows(cur, clean, spec, run_id)
+n_read += read
+n_rejected += rejected
+n_loaded += loaded
+log.info("%-20s lues=%d rejetées=%d chargées=%d",
+name, read, rejected, loaded)
+
+save_run(conn, run_id, started, "SUCCESS", fhash,
+n_read, n_rejected, n_loaded, None, anomalies)
+log.info("Run %s terminé : %d lues, %d rejetées, %d chargées.",
+run_id, n_read, n_rejected, n_loaded)
+return 0
+
+except Exception as exc: # rollback déjà fait par le context manager
+log.exception("Run %s en échec", run_id)
+try:
+conn.rollback()
+save_run(conn, run_id, started, "FAILED", fhash,
+n_read, n_rejected, 0, str(exc), anomalies)
+except Exception:
+log.exception("Impossible d'écrire l'échec dans etl_runs")
+return 1
+finally:
+conn.close()
+
+def main():
+p = argparse.ArgumentParser(description="Pipeline ETL")
+p.add_argument("--input-dir", required=True, help="Dossier des fichiers sources")
+p.add_argument("--log-dir", default="logs", help="Dossier des logs")
+p.add_argument("--run-id", help="Identifiant du run (auto par défaut)")
+p.add_argument("--dsn", default=os.getenv("DATABASE_URL"), help="DSN PostgreSQL")
+p.add_argument("--force", action="store_true", help="Recharger même si déjà traité")
+args = p.parse_args()
+
+if not args.dsn:
+sys.exit("DSN manquant (--dsn ou DATABASE_URL)")
+
+Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s %(levelname)s %(message)s",
+handlers=[
+logging.StreamHandler(),
+logging.FileHandler(Path(args.log_dir) / f"etl_{datetime.now():%Y%m%d}.log",
+encoding="utf-8"),
+ ],
+)
+sys.exit(run(args))
+
+if name == "main":
+main()
