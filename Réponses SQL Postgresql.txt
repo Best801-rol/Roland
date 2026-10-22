@@ -1,0 +1,124 @@
+-- =====================================================================
+-- Calcul du PAR 30 / 60 / 90 / 120 (global et par point de vente)
+-- PostgreSQL | Date de référence modifiable dans le CTE "params"
+-- =====================================================================
+-- DEFINITIONS
+-- encours = somme des (montant_dû - montant_payé) de TOUTES les
+-- échéances du contrat (échues et à venir), plancher 0
+-- jours_retard = date_ref - date de la plus ancienne échéance impayée
+-- PAR X = encours des contrats avec jours_retard > X
+-- / encours total des contrats actifs
+-- HYPOTHESES (à annoncer dans le livrable)
+-- 1. Seuls les contrats 'actif' sont dans le périmètre
+-- 2. Les paiements postérieurs à la date de référence sont ignorés
+-- 3. Les paiements en doublon sont dédoublonnés
+-- 4. L'encours est issu de l'échéancier (inclut les intérêts)
+-- 5. Client sans point de vente => 'Non renseigné'
+-- =====================================================================
+
+WITH params AS (
+SELECT DATE '2026-08-31' AS date_ref
+),
+
+-- 1. Dédoublonnage des paiements (même contrat, échéance, montants, date)
+paiements_dedup AS (
+SELECT DISTINCT id_contrat, date_échéance, montant_dû,
+date_paiement, montant_payé
+FROM paiements
+),
+
+-- 2. Montant payé à la date de référence, par échéance
+echeances AS (
+SELECT p.id_contrat,
+p.date_échéance,
+p.montant_dû,
+COALESCE(
+CASE WHEN p.date_paiement <= pr.date_ref
+THEN p.montant_payé END, 0) AS payé_a_date
+FROM paiements_dedup p
+CROSS JOIN params pr
+),
+
+-- 3. Périmètre : contrats actifs signés avant la date de référence
+contrats_actifs AS (
+SELECT c.id_contrat,
+COALESCE(cl.point_de_vente, 'Non renseigné') AS point_de_vente
+FROM contrats c
+LEFT JOIN clients cl USING (id_client)
+CROSS JOIN params pr
+WHERE c.statut = 'actif'
+AND c.date_signature <= pr.date_ref
+),
+
+-- 4. Encours et jours de retard par contrat
+par_contrat AS (
+SELECT ca.id_contrat,
+ca.point_de_vente,
+SUM(GREATEST(e.montant_dû - e.payé_a_date, 0)) AS encours,
+COALESCE(
+MAX(pr.date_ref - e.date_échéance)
+FILTER (WHERE e.date_échéance < pr.date_ref
+AND e.montant_dû - e.payé_a_date > 0),
+0) AS jours_retard
+FROM contrats_actifs ca
+JOIN echeances e USING (id_contrat)
+CROSS JOIN params pr
+GROUP BY ca.id_contrat, ca.point_de_vente
+)
+
+-- 5. PAR par point de vente + ligne GLOBAL
+SELECT CASE WHEN GROUPING(point_de_vente) = 1
+THEN 'GLOBAL' ELSE point_de_vente END AS point_de_vente,
+COUNT(*) AS nb_contrats,
+ROUND(SUM(encours), 0) AS encours_total,
+ROUND(100.0 * SUM(encours) FILTER (WHERE jours_retard > 30)
+/ NULLIF(SUM(encours), 0), 2) AS par30_pct,
+ROUND(100.0 * SUM(encours) FILTER (WHERE jours_retard > 60)
+/ NULLIF(SUM(encours), 0), 2) AS par60_pct,
+ROUND(100.0 * SUM(encours) FILTER (WHERE jours_retard > 90)
+/ NULLIF(SUM(encours), 0), 2) AS par90_pct,
+ROUND(100.0 * SUM(encours) FILTER (WHERE jours_retard > 120)
+/ NULLIF(SUM(encours), 0), 2) AS par120_pct
+FROM par_contrat
+GROUP BY ROLLUP (point_de_vente)
+ORDER BY GROUPING(point_de_vente), par30_pct DESC NULLS LAST;
+
+-- =====================================================================
+-- CONTROLES AVANT PUBLICATION (à exécuter séparément)
+-- =====================================================================
+
+-- A. Doublons de paiements
+SELECT id_contrat, date_échéance, COUNT() AS nb
+FROM paiements
+GROUP BY id_contrat, date_échéance, montant_dû, date_paiement, montant_payé
+HAVING COUNT() > 1;
+
+-- B. Paiements antérieurs à la signature du contrat
+SELECT p.id_contrat, c.date_signature, p.date_paiement
+FROM paiements p
+JOIN contrats c USING (id_contrat)
+WHERE p.date_paiement < c.date_signature;
+
+-- C. Contrats soldés avec un impayé
+SELECT c.id_contrat, SUM(p.montant_dû - COALESCE(p.montant_payé, 0)) AS impayé
+FROM contrats c
+JOIN paiements p USING (id_contrat)
+WHERE c.statut = 'soldé'
+GROUP BY c.id_contrat
+HAVING SUM(p.montant_dû - COALESCE(p.montant_payé, 0)) > 0;
+
+-- D. Clients sans point de vente
+SELECT id_client, nom FROM clients WHERE point_de_vente IS NULL;
+
+-- E. Réconciliation : encours calculé vs total comptable (48 500 000 FCFA)
+-- Remplacer <ENCOURS_CALCULE> par la valeur "GLOBAL" du résultat ci-dessus
+-- SELECT <ENCOURS_CALCULE> - 48500000 AS ecart,
+-- ROUND(100.0 * (<ENCOURS_CALCULE> - 48500000) / 48500000, 2) AS ecart_pct;
+
+-- =====================================================================
+-- VARIANTE "INSTITUTIONNEL" (question bonus)
+-- Même base, définition distincte : ne modifier que le calcul de
+-- jours_retard (ex. échéance la plus ancienne impayée au-delà d'une
+-- tolérance de 5 jours). Nommer la métrique par30_institutionnel
+-- et l'ajouter au dictionnaire des indicateurs. L'existant reste inchangé.
+-- =====================================================================
