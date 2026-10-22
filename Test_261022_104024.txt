@@ -1,0 +1,80 @@
+1.SELECT
+s.subsidiary_code,
+COUNT(c.contract_id) AS nb_contracts,
+COALESCE(SUM(c.contract_amount), 0) AS total_amount
+FROM subsidiaries s
+LEFT JOIN customers cu
+ON s.subsidiary_code = cu.subsidiary_code
+LEFT JOIN contracts c
+ON cu.customer_id = c.customer_id
+GROUP BY s.subsidiary_code
+ORDER BY s.subsidiary_code;
+
+2.SELECT
+c.contract_id
+FROM contracts c
+WHERE NOT EXISTS (
+SELECT 1
+FROM payments p
+WHERE p.contract_id = c.contract_id
+AND p.transaction_status = 'SUCCESS'
+)
+ORDER BY c.contract_id;
+
+3.SELECT
+c.contract_id,
+c.contract_amount,
+COALESCE(
+SUM(
+CASE
+WHEN p.transaction_status = 'SUCCESS'
+THEN p.amount
+ELSE 0
+END
+),
+0
+) AS collected,
+CASE
+WHEN c.contract_amount IS NULL THEN NULL
+ELSE ROUND(
+COALESCE(
+SUM(
+CASE
+WHEN p.transaction_status = 'SUCCESS'
+THEN p.amount
+ELSE 0
+END
+),
+0
+) / NULLIF(c.contract_amount, 0),
+2
+)
+END AS recovery_rate
+FROM contracts c
+LEFT JOIN payments p
+ON c.contract_id = p.contract_id
+GROUP BY
+c.contract_id,
+c.contract_amount
+ORDER BY c.contract_id;
+
+4.WITH ranked_payments AS (
+SELECT
+transaction_id,
+transaction_status,
+amount,
+loaded_at,
+ROW_NUMBER() OVER (
+PARTITION BY transaction_id
+ORDER BY loaded_at DESC
+) AS rn
+FROM raw_payments
+)
+SELECT
+transaction_id,
+transaction_status,
+amount,
+loaded_at
+FROM ranked_payments
+WHERE rn = 1
+ORDER BY transaction_id;
