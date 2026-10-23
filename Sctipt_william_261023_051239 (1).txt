@@ -1,0 +1,39 @@
+OPTION 2 : Version Optimisée (Recommandée - Ultra rapide)
+=====================================================================
+Cette méthode fait exactement la même chose, mais utilise la puissance
+des jointures (merge) de Pandas au lieu des boucles.
+
+1. Jointure entre les transactions et les validations
+df_merged = pd.merge(
+df_final,
+validations,
+left_on="Cpt Bank",
+right_on="NCP_S",
+suffixes=('', '_valid')
+)
+
+On garde les validations antérieures ou égales à la date de transaction
+df_merged = df_merged[df_merged["DDEB_S"] <= df_merged["Business Day"]]
+
+2. Jointure avec la table des levées
+df_final_merged = pd.merge(
+df_merged,
+levees,
+left_on=["Cpt Bank", "OPP_S"],
+right_on=["NCP_S", "OPP_S"],
+suffixes=('', '_levee')
+)
+
+3. Filtrage : On garde les lignes où AUCUNE levée n'a été trouvée
+(isna) OU si la levée a eu lieu APRÈS la date de la transaction.
+condition_opposition_active = (
+df_final_merged["DDEB_S_levee"].isna() |
+(df_final_merged["DDEB_S_levee"] > df_final_merged["Business Day"])
+)
+
+4. Résultat final (on supprime les doublons au cas où une transaction aurait plusieurs oppositions)
+transactions_sous_opposition_v2 = df_final_merged[condition_opposition_active].drop_duplicates(subset=['Pk'])
+
+print("\n=== OPTION 2 (Optimisée) ===")
+print("Nombre de transactions suspectes :", len(transactions_sous_opposition_v2))
+display(transactions_sous_opposition_v2)
