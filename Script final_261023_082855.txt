@@ -1,0 +1,65 @@
+import pandas as pd
+
+---------------------------------------------------------------
+1. Chargement (à adapter : read_excel / SQL...)
+---------------------------------------------------------------
+ops = pd.read_csv("operations.csv", parse_dates=["date_operation"])
+opp = pd.read_csv("oppositions_kyc.csv", parse_dates=["date_debut", "date_fin"])
+ops : id_operation, compte, date_operation, montant, ...
+opp : compte, date_debut, date_fin, statut ('V' = valide, 'L' = levée)
+
+---------------------------------------------------------------
+2. Nettoyage / contrôles
+---------------------------------------------------------------
+opp["statut"] = opp["statut"].str.strip().str.upper()
+
+anomalies = opp[(opp["statut"] == "L") & opp["date_fin"].isna()]
+if not anomalies.empty:
+print("ATTENTION - oppositions L sans date_fin (traitées comme valides) :")
+print(anomalies)
+
+---------------------------------------------------------------
+3. Croisement opérations x oppositions sur le compte
+---------------------------------------------------------------
+ops = ops.reset_index(names="_idx")
+m = ops.merge(opp, on="compte", how="inner")
+
+apres_debut = m["date_operation"] >= m["date_debut"]
+
+V (ou L sans date_fin) : opposition toujours valide -> après date_debut
+cond_valide = apres_debut & (
+(m["statut"] == "V") | ((m["statut"] == "L") & m["date_fin"].isna())
+)
+
+L : opposition levée -> entre date_debut et date_fin
+cond_levee = (
+apres_debut
+& (m["statut"] == "L")
+& (m["date_operation"] <= m["date_fin"])
+)
+
+masque = cond_valide | cond_levee
+
+---------------------------------------------------------------
+4. Marquage
+---------------------------------------------------------------
+ops["OPERATION_SOUS_OPPOSITION_KYC"] = ops["_idx"].isin(m.loc[masque, "_idx"])
+
+statut = (
+m.loc[masque, ["_idx", "statut"]]
+.drop_duplicates("_idx")
+.set_index("_idx")["statut"]
+)
+ops["STATUT_OPPOSITION"] = ops["_idx"].map(statut)
+
+ops = ops.drop(columns="_idx")
+
+---------------------------------------------------------------
+5. Résultats
+---------------------------------------------------------------
+alertes = ops[ops["OPERATION_SOUS_OPPOSITION_KYC"]]
+print(f"{len(alertes)} opération(s) sous opposition KYC sur {len(ops)}")
+print(alertes.groupby("compte")["montant"].agg(["count", "sum"]))
+
+ops.to_excel("operations_marquees.xlsx", index=False)
+alertes.to_excel("operations_sous_opposition_kyc.xlsx", index=False)
