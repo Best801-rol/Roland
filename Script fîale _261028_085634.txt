@@ -1,0 +1,72 @@
+import pandas as pd
+
+1. Convertir les dates
+df_final["Business Day"] = pd.to_datetime(
+df_final["Business Day"], errors="coerce", dayfirst=True
+)
+
+df_final["DDEB_S"] = pd.to_datetime(
+df_final["DDEB_S"], errors="coerce", dayfirst=True
+)
+
+2. Séparer les validations et les levées
+validations = (
+df_final.loc[df_final["ETA_S"].eq("V"),
+["NCP_S", "OPP_S", "DDEB_S"]]
+.drop_duplicates()
+.rename(columns={"DDEB_S": "date_validation"})
+)
+
+levees = (
+df_final.loc[df_final["ETA_S"].eq("L"),
+["NCP_S", "OPP_S", "DDEB_S"]]
+.drop_duplicates()
+.rename(columns={"DDEB_S": "date_levee"})
+)
+
+3. Associer chaque validation à la première levée ultérieure
+periodes = pd.merge_asof(
+validations.sort_values("date_validation"),
+levees.sort_values("date_levee"),
+left_on="date_validation",
+right_on="date_levee",
+by=["NCP_S", "OPP_S"],
+direction="forward",
+allow_exact_matches=False
+)
+
+4. Rattacher les périodes aux opérations
+ops = df_final.loc[
+df_final["Business Day"].notna()
+& df_final["Cpt_Bank"].notna()
+].copy()
+
+ops["_id_operation"] = ops.index
+
+candidats = ops.merge(
+periodes,
+left_on="Cpt_Bank",
+right_on="NCP_S",
+how="inner"
+)
+
+5. Garder uniquement les opérations pendant la période active
+masque = (
+(candidats["Business Day"] >= candidats["date_validation"])
+& (
+candidats["date_levee"].isna()
+| (candidats["Business Day"] < candidats["date_levee"])
+)
+)
+
+ids = candidats.loc[masque, "_id_operation"].unique()
+
+transactions_sous_opposition = (
+ops.loc[ops["_id_operation"].isin(ids)]
+.drop(columns="_id_operation")
+)
+
+print("Nombre d'opérations sous opposition :",
+len(transactions_sous_opposition))
+
+display(transactions_sous_opposition)
