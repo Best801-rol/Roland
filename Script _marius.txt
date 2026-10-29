@@ -1,0 +1,68 @@
+import pandas as pd
+import holidays
+
+df = df_histor_vl_m.copy()
+
+1. Convertir les dates
+df["Date_actuel"] = pd.to_datetime(
+df["Date_actuel"], errors="coerce"
+).dt.normalize()
+
+df = df.dropna(subset=["FCP", "Date_actuel"])
+
+2. Générer les jours fériés pour toutes les années
+annees = range(
+df["Date_actuel"].min().year,
+df["Date_actuel"].max().year + 1
+)
+
+jours_feries = pd.to_datetime(
+list(holidays.country_holidays("CI", years=list(annees)).keys())
+)
+
+3. Générer le calendrier des jours ouvrés
+calendrier = pd.DataFrame({
+"Date_attendue": pd.bdate_range(
+df["Date_actuel"].min(),
+df["Date_actuel"].max()
+)
+})
+
+calendrier = calendrier.loc[
+~calendrier["Date_attendue"].isin(jours_feries)
+]
+
+4. Générer les combinaisons FCP / dates attendues
+fonds = df[["FCP"]].drop_duplicates()
+
+attendues = fonds.merge(calendrier, how="cross")
+
+5. Identifier les dates manquantes
+dates_presentes = df[["FCP", "Date_actuel"]].drop_duplicates()
+
+controle = attendues.merge(
+dates_presentes,
+left_on=["FCP", "Date_attendue"],
+right_on=["FCP", "Date_actuel"],
+how="left",
+indicator=True
+)
+
+detail_dates_manquantes = (
+controle.loc[
+controle["_merge"] == "left_only",
+["FCP", "Date_attendue"]
+]
+.rename(columns={"Date_attendue": "Date_manquante"})
+)
+
+6. Synthèse par fonds
+bilan_exhaustivite = (
+detail_dates_manquantes.groupby("FCP")
+.size()
+.rename("Nb_dates_manquantes")
+.reset_index()
+)
+
+display(bilan_exhaustivite)
+display(detail_dates_manquantes)
