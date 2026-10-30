@@ -1,0 +1,117 @@
+from datetime import datetime, timedelta
+import xmlrpc.client
+import pandas as pd
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+--- CONFIGURATION ODOO ---
+ODOO_URL = "https://votre-instance.odoo.com"
+ODOO_DB = "votre_base_de_donnees"
+ODOO_USER = "votre_email@domaine.com"
+ODOO_API_KEY = "votre_cle_api_odoo"
+
+default_args = {
+'owner': 'airflow',
+'depends_on_past': False,
+'start_date': datetime(2026, 1, 1),
+'retries': 1,
+'retry_delay': timedelta(minutes=5),
+}
+
+def extract_from_odoo(**kwargs):
+"""Étape E : Extraction des données depuis l'API XML-RPC d'Odoo"""
+# 1. Authentification pour obtenir le UID
+common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
+uid = common.authenticate(ODOO_DB, ODOO_USER, ODOO_API_KEY, {})
+
+if not uid:
+raise Exception("Échec de l'authentification sur Odoo")
+
+# 2. Connexion au point de terminaison des objets
+models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
+
+# 3. Définition des filtres et des champs à récupérer
+domain = [('customer_rank', '>', 0)] # Exemple: Uniquement les clients
+fields = ['id', 'name', 'email', 'phone', 'create_date']
+
+# 4. Lecture des enregistrements
+records = models.execute_kw(
+ODOO_DB, uid, ODOO_API_KEY,
+'res.partner', 'search_read',
+[domain], {'fields': fields}
+)
+
+# Push des données brutes dans XCom pour l'étape suivante
+kwargs['ti'].xcom_push(key='raw_odoo_data', value=records)
+
+def transform_data(**kwargs):
+"""Étape T : Nettoyage et structuration des données en DataFrame"""
+ti = kwargs['ti']
+records = ti.xcom_pull(key='raw_odoo_data', task_ids='extract_task')
+
+if not records:
+print("Aucune donnée reçue.")
+return
+
+df = pd.DataFrame(records)
+
+# Transformation : Gestion des valeurs manquantes, renommage, ou formatage de dates
+df['email'] = df['email'].fillna('Inconnu')
+df['phone'] = df['phone'].fillna('Non renseigné')
+df['create_date'] = pd.to_datetime(df['create_date'])
+df['extracted_at'] = datetime.utcnow()
+
+# Push des données nettoyées au format dictionnaire
+ti.xcom_push(key='transformed_data', value=df.to_dict(orient='records'))
+
+def load_to_postgres(**kwargs):
+"""Étape L : Chargement des données dans PostgreSQL"""
+ti = kwargs['ti']
+data = ti.xcom_pull(key='transformed_data', task_ids='transform_task')
+
+if not data:
+print("Aucune donnée à charger.")
+return
+
+df = pd.DataFrame(data)
+
+# Utilisation du PostgresHook d'Airflow
+postgres_hook = PostgresHook(postgres_conn_id='postgres_default')
+engine = postgres_hook.get_sqlalchemy_engine()
+
+# Insertion des données (écrase la table à chaque run ou ajoute avec if_exists='append')
+df.to_sql(
+name='stg_odoo_partners',
+con=engine,
+if_exists='replace',
+index=False
+)
+print(f"Chargement réussi de {len(df)} lignes dans PostgreSQL.")
+
+--- DÉFINITION DU DAG ---
+with DAG(
+'odoo_to_postgres_etl',
+default_args=default_args,
+description='Pipeline ETL de récupération des données Odoo vers PostgreSQL',
+schedule_interval='@daily',
+catchup=False,
+) as dag:
+
+extract_task = PythonOperator(
+task_id='extract_task',
+python_callable=extract_from_odoo,
+)
+
+transform_task = PythonOperator(
+task_id='transform_task',
+python_callable=transform_data,
+)
+
+load_task = PythonOperator(
+task_id='load_task',
+python_callable=load_to_postgres,
+)
+
+# Dépendances des tâches
+extract_task >> transform_task >> load_task
